@@ -1,0 +1,507 @@
+#+title: Protocol Support in =pulley.cps=
+#+author: Nathan Davis
+#+date:
+
+#+begin_comment
+Copyright 2016 Positronic Solutions, LLC.
+
+This file is part of pulley.cps.
+
+pulley.cps is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+pulley.cps is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with pulley.cps.  If not, see <http://www.gnu.org/licenses/>.
+#+end_comment
+
+* Introduction
+  One of the goals of [[https://github.com/positronic-solutions/pulley.cps][=pulley.cps=]]
+  is to support as much of Clojure as reasonable.
+  In Clojure, protocols are implemented as regular Clojure functions
+  (instances of =IFn=).
+  Therefore, there is theoretically nothing preventing us
+  from providing CPS-transformed versions of those functions.
+
+  This article explores one strategy for protocol support in =pulley.cps=,
+  and presents a basic implementation of =extend=
+  using that strategy.
+* Strategy
+  Basically, we need to do the following:
+
+  * Provide CPS overrides for the dispatch functions.
+    We need to do this for any protocol
+    that is extended with a CPS implementation.
+    * Need to "rename" the "method builder" vars,
+      otherwise the next non-CPSed extension of the protocol
+      will overwrite our CPS-induced goodness.
+  * Any CPS implementation of a protocol
+    (=extend-type=, =extend-protocol=, =deftype=, =defrecord=, =reify=)
+    needs to be transformed:
+    * Ensure overrides are in place for the protocol in question.
+    * Transform the given functions
+    * Update protocol's =:impls= to include the provided implementation
+* Implementation
+** =extend=
+   Conveniently, both =extend-type= and =extend-protocol=
+   are macro-expressed in terms of =extend=.
+   Futhermore, =extend= is just a regular function.
+   Therefore, we can effectively handle =extend-type= and =extend-protocol=
+   by simply providing a CPS override for =extend=.
+
+   This section presents such an override.
+   The code presented here suffers (at least) two severe limitations:
+
+   1. The result from looking up a method implementation is not cached.
+   2. Types that implement the Java interface are not supported
+      (i.e., the dispatch functions check if the given object
+      implements the protocol's interface).
+
+   The end goal is to override =extend= for CPS contexts.
+   Here's an implementation of that using =override-fn*=
+   and =fn->callable=.
+
+   #+name: extend
+   #+begin_src clojure
+     (cps/override-fn* extend
+       (cps/fn->callable (fn
+                           ([cont env atype]
+                             ;; Nothing to do
+                             (cont nil))
+                           ([cont env atype proto methods & others]
+                             (ensure-cps-protocol proto)
+                             (extend atype proto methods)
+                             (cps/thunk (apply cps/call extend cont env atype others))))))
+   #+end_src
+
+   This is a slightly messier than ideal,
+   because we must manually CPS transform the =fn= provided to =fn->callable=.
+   However, its core logic is to loop through each $(protocol, methods)$ pair
+   and handle them in turn.
+   Each pair is handled by
+   * Ensuring the protocol has been appropriately transformed
+     (this is the call to =ensure-cps-protocol=).
+     This mainly involves changing the protocol's dispatch functions
+     to CPS-transformed versions of the original.
+   * Calling Clojure's version of =extend=.
+     This is the first call to =extend=.
+     The reader should note that this call is not to the overridden =extend=
+     (i.e., the function we provide here),
+     but to the original Clojure version of =extend=,
+     since we do not transform the invocation with =call=.
+     The second call to =extend=, on the other hand,
+     is a recursive call to the overridden version.
+     This call ensures the rest of the protocols are handled.
+
+   When we =extend= a protocol using CPS functions,
+   we must also ensure the protocol itself is transformed.
+   Otherwise, calling a dispatch functions will cause a fracture
+   in the CPS context.
+
+   We use the namespaced keyword =::protocol=
+   to "mark" a protocol as transformed.
+   So we only perform the transformation
+   if that key does not exist in the protocol map.
+
+   #+name: ensure-cps-protocol
+   #+begin_src clojure
+     (defn ensure-cps-protocol [proto]
+       (if-let [v (:var proto)]
+         ;; then (appears to be protocol => transform if necessary)
+         (when (not (::protocol @v))
+           (transform-protocol v))
+         ;; else (not protocol => throw exception
+         (throw (new IllegalStateException (str "Invalid protocol: " proto)))))
+   #+end_src
+
+   The actual transformation is performed in =transform-protocol=.
+   We use =alter-var-root= on the protocol's =Var=
+   to effect the transformation.
+
+   #+name: transform-protocol
+   #+begin_src clojure
+     (defn transform-protocol [proto-var]
+       (alter-var-root proto-var
+         (fn [proto]
+           ;; Check that the protocol hasn't already been transformed
+           (if (::protocol proto)
+             ;; then (already transformed)
+             proto
+             ;; else (needs transforming)
+             (let [old-builders (:method-buildres proto)]
+               (alter-meta! proto-var assoc ::protocol true)
+               ;; This is yucky code that weaves side-effects into update-in.
+               ;; What's a better way to structure this?
+               (update-in proto [:method-builders]
+                          (fn [builders]
+                            (reduce (fn [result [old-var builder]]
+                                      (let [method-name (-> old-var
+                                                            (meta)
+                                                            (:name)
+                                                            (keyword))]
+                                        (with-local-vars [new-var nil]
+                                          (alter-var-root new-var (constantly @old-var))
+                                          (alter-var-root old-var
+                                                          (fn [_]
+                                                            (method-dispatcher proto-var new-var method-name)))
+                                          (assoc result new-var builder))))
+                                    {}
+                                    builders))))))))
+   #+end_src
+
+   Finally, =method-dispatcher= is used to construct a function
+   for dispatching a given method on a given protocol.
+   Note the complete lack of caching and interface support.
+   Also, we could simplify this by using =cps-fn=
+   instead of =fn->callable=.
+   However, we'd need to implement a CPS-override for =find-protocol-method=
+   in order to remain compatible =with-strict-cps=.
+
+   #+name: method-dispatcher
+   #+begin_src clojure
+     (defn method-dispatcher [proto-var native-method method-name]
+       (let [interface (:on-interface @proto-var)]
+         (cps/fn->callable (fn [cont env obj & args]
+                             ;; If protocol's interface is implemented,
+                             ;; dispatch via native version
+                             (if (instance? interface obj)
+                               (apply native-method obj args)
+                               ;; Use MethodImplCache (or similar)
+                               ;; for increased performance
+                               (if-let [method (find-protocol-method @proto-var method-name obj)]
+                                 (cps/thunk (apply cps/call method cont env obj args))
+                                 (cps/thunk (cps/call cps/raise cont env
+                                                      (new UnsupportedOperationException
+                                                           (str "No implementation found for " method-name " on " (type obj)))))))))))
+   #+end_src
+* Tests
+  :PROPERTIES:
+  :header-args: :noweb yes
+  :END:
+
+  Suppose we define a protocol, =Foo=, as:
+  #+name: test/Foo
+  #+begin_src clojure
+    (defprotocol Foo
+      (foo [self]))
+  #+end_src
+
+  Now we can extend =Foo= to =String=:
+
+  #+name: test/extend-Foo-to-String
+  #+begin_src clojure
+    (extend-protocol Foo
+      String
+      (foo [s]
+        (count s)))
+  #+end_src
+
+  ... and call it:
+
+  #+name: test/foo-with-string::code
+  #+begin_src clojure
+    (foo "foo")
+  #+end_src
+
+  #+name: test/foo-with-string::result
+  #+begin_src clojure
+    3
+  #+end_src
+
+  We can also call it in a =cps= context:
+
+  #+name: test/foo-with-string::cps::code
+  #+begin_src clojure
+    (cps
+      <<test/foo-with-string::code>>)
+  #+end_src
+
+  But if we call it =with-strict-cps=:
+
+  #+name: test/foo-with-string::strict-cps::code
+  #+begin_src clojure
+    (with-strict-cps
+      <<test/foo-with-string::cps::code>>)
+  #+end_src
+
+  This fails, because we did not extend =Foo=
+  to =String= within a CPS context.
+
+  Now let's extend =Foo= to =Long=,
+  but this time we'll do the extension in a CPS context:
+
+  #+name: test/extend-Foo-to-Long
+  #+begin_src clojure
+    (cps (extend-protocol Foo
+           Long
+           (foo [x]
+             x)))
+  #+end_src
+
+  Now, we can call =(foo 4)=:
+
+  #+name: test/foo-with-long::code
+  #+begin_src clojure
+    (foo 4)
+  #+end_src
+
+  #+name: test/foo-with-long::result
+  #+begin_src clojure
+    4
+  #+end_src
+
+  And inside a CPS context:
+
+  #+name: test/foo-with-long::cps::code
+  #+begin_src clojure
+    (cps <<test/foo-with-long::code>>)
+  #+end_src
+
+  And even =with-strict-cps=:
+
+  #+name: test/foo-with-long::strict-cps::code
+  #+begin_src clojure
+    (with-strict-cps <<test/foo-with-long::cps::code>>)
+  #+end_src
+
+  Just for good measure, let's make sure we aren't introducing
+  any recursive trampolines:
+
+  #+name: test/foo-with-long::strict-cps::without-recursive-trampolines::code
+  #+begin_src clojure
+    (without-recursive-trampolines <<test/foo-with-long::strict-cps::code>>)
+  #+end_src
+
+  We also need to verify that we can extend the protocol via
+  the generated interface.
+
+  #+name: test/Bar
+  #+begin_src clojure
+    (deftype Bar [x]
+      Foo
+      (foo [self] (foo x)))
+  #+end_src
+
+  Now, we can create a =Bar= and invoke =foo= outside a CPS context:
+
+  #+begin_src clojure
+    (def foobar (new Bar "foobar"))
+  #+end_src
+
+  #+name: test/foobar
+  #+begin_src clojure
+    (foo foobar)
+  #+end_src
+
+  #+name: test/foobar::result
+  #+begin_src clojure
+    6
+  #+end_src
+
+  We get the same result inside a CPS context:
+
+  #+name: test/foobar::cps
+  #+begin_src clojure
+    (cps (foo foobar))
+  #+end_src
+
+  As expected, =with-strict-cps= yields an exception:
+
+  #+name: test/foobar::strict-cps
+  #+begin_src clojure
+    (with-strict-cps <<test/foobar::cps>>)
+  #+end_src
+
+  #+name: test/foobar::strict-cps::ex
+  #+begin_src clojure
+    IllegalStateException
+  #+end_src
+
+  #+name: test/foobar::strict-cps::ex-msg
+  #+begin_src clojure
+    "Attempt to call non-CPS routine"
+  #+end_src
+
+  This is not suprising, as we are ultimately invoking a non-CPS function
+  for the dispatch.
+
+  Somewhat less intuitively, the following also does not work:
+
+  #+name: test/foobar::without-recursive-trampolines
+  #+begin_src clojure
+    (without-recursive-trampolines <<test/foobar::cps>>)
+  #+end_src
+
+  #+name: test/foobar::without-recursive-trampolines::ex
+  #+begin_src clojure
+    IllegalStateException
+  #+end_src
+
+  #+name: test/foobar::without-recursive-trampolines::ex-msg
+  #+begin_src clojure
+    "Attempt to invoke recursive trampoline, but *allow-recursive-trampolines* does not allow it."
+  #+end_src
+* Conclusion
+  Adding protocol support to =pulley.cps= looks promising.
+  More work is necessary, but already a basic implementation of =extend=
+  has been developed.
+  This has some problems, such as efficiency,
+  but I am hopeful these problems can be solved fairly easily.
+
+  Once the implementation of =extend= has reached acceptable standards,
+  we will need to focus on implementing remaining protocol forms.
+  These are basically =defprotocol= and type definitions
+  (=reify=, =deftype=, =defrecord=, etc.)
+  that involve protocol implementations.
+
+  =defprotocol= probably can just be passed through unchanged.
+  That is, we really don't need to transform it —
+  transformation can be defered until it is forced
+  by another form (e.g., =extend=).
+
+  A strategy for implementing type definitions will need to be developed.
+  One viable strategy might be to implement an interface
+  that exposes a map of protocol methods for an object.
+  Then, e.g. the transformation of a =reify= form
+  would include an implementation of this interface.
+  The dispatch methods would need to be altered
+  to use this interface when it is implemented.
+  Other type definition forms would be similarly transformed.
+
+  One interesting aspect that merits further exploration
+  is the possibility of using a similar strategy
+  to implement CPS dispatching of Java interface methods.
+  I.e., instead of returning a map of protocol implementations,
+  we can return a map of interface implementations.
+  Objects that wish to participate in the CPS protocol
+  for a particular set of interfaces can implement this interface.
+  Similar to the implementation for protocols,
+  invocation of Java interface methods would need
+  to take this interface into account in transformed code.
+* Source
+** =protocols.clj=
+#+name: protocols.clj
+#+begin_src clojure :noweb yes :mkdirp yes :tangle src/com/positronic_solutions/pulley/cps/experimental/protocols.clj
+  ;; Copyright 2016 Positronic Solutions, LLC.
+  ;;
+  ;; This file is part of pulley.cps.
+  ;;
+  ;; pulley.cps is free software: you can redistribute it and/or modify
+  ;; it under the terms of the GNU Lesser General Public License as published by
+  ;; the Free Software Foundation, either version 3 of the License, or
+  ;; (at your option) any later version.
+  ;;
+  ;; pulley.cps is distributed in the hope that it will be useful,
+  ;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+  ;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  ;; GNU General Public License for more details.
+  ;;
+  ;; You should have received a copy of the GNU Lesser General Public License
+  ;; along with pulley.cps.  If not, see <http://www.gnu.org/licenses/>.
+
+  ;; Note:  This file is automatically generated from protocols.org
+  ;;        using org-bable-tangle.  Please make any changes
+  ;;        to the .org file and re-tangle.
+
+  (ns com.positronic-solutions.pulley.cps.experimental.protocols
+    "Experimental module that allows protocols to be extended
+    with CPS-transformed implementations.
+
+    Note:  This module is considered experimental and may be removed
+           or changed extensively in the future.
+           Use it at your own risk!"
+    (:require [com.positronic-solutions.pulley.cps :as cps]))
+
+  <<method-dispatcher>>
+
+  <<transform-protocol>>
+
+  <<ensure-cps-protocol>>
+
+  <<extend>>
+
+#+end_src
+** =protocols_test.clj=
+   #+name: protocols_test.clj
+   #+begin_src clojure :noweb yes :mkdirp yes :tangle test/com/positronic_solutions/pulley/cps/experimental/protocols_test.clj
+     ;; Copyright 2016 Positronic Solutions, LLC.
+     ;;
+     ;; This file is part of pulley.cps.
+     ;;
+     ;; pulley.cps is free software: you can redistribute it and/or modify
+     ;; it under the terms of the GNU Lesser General Public License as published by
+     ;; the Free Software Foundation, either version 3 of the License, or
+     ;; (at your option) any later version.
+     ;;
+     ;; pulley.cps is distributed in the hope that it will be useful,
+     ;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+     ;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+     ;; GNU General Public License for more details.
+     ;;
+     ;; You should have received a copy of the GNU Lesser General Public License
+     ;; along with pulley.cps.  If not, see <http://www.gnu.org/licenses/>.
+
+     ;; Note:  This file is automatically generated from protocols.org
+     ;;        using org-bable-tangle.  Please make any changes
+     ;;        to the .org file and re-tangle.
+
+     (ns com.positronic-solutions.pulley.cps.experimental.protocols-test
+       (:require [clojure.test :refer :all]
+                 [com.positronic-solutions.pulley.cps :refer [cps
+                                                              cps-fn
+                                                              with-strict-cps
+                                                              without-recursive-trampolines]]
+                 [com.positronic-solutions.pulley.cps.experimental.protocols]))
+
+     <<test/Foo>>
+
+     <<test/Bar>>
+
+     (deftest test-Foo
+       (testing "String"
+         <<test/extend-Foo-to-String>>
+         (testing "native"
+           (is (= <<test/foo-with-string::result>>
+                  <<test/foo-with-string::code>>)))
+         (testing "cps"
+           (is (= <<test/foo-with-string::result>>
+                  <<test/foo-with-string::cps::code>>)))
+         (testing "with-strict-cps"
+           (is (thrown? java.lang.IllegalStateException
+                        <<test/foo-with-string::strict-cps::code>>))))
+
+       (testing "Long"
+         <<test/extend-Foo-to-Long>>
+         (testing "native"
+           (is (= <<test/foo-with-long::result>>
+                  <<test/foo-with-long::code>>)))
+         (testing "cps"
+           (is (= <<test/foo-with-long::result>>
+                  <<test/foo-with-long::cps::code>>)))
+         (testing "with-strict-cps"
+           (is (= <<test/foo-with-long::result>>
+                          <<test/foo-with-long::strict-cps::code>>)))
+         (testing "without-recursive-trampolines"
+           (is (= <<test/foo-with-long::result>>
+                  <<test/foo-with-long::strict-cps::without-recursive-trampolines::code>>))))
+
+       (testing "Bar"
+         (let [foobar (new Bar "foobar")]
+           (testing "native"
+             (is (= <<test/foobar::result>>
+                    <<test/foobar>>))
+             (is (= <<test/foobar::result>>
+                    <<test/foobar::cps>>))
+             (is (thrown? <<test/foobar::strict-cps::ex>>
+                          #<<test/foobar::strict-cps::ex-msg>>
+                          <<test/foobar::strict-cps>>))
+             (is (thrown? <<test/foobar::without-recursive-trampolines::ex>>
+                          #<<test/foobar::without-recursive-trampolines::ex-msg>>
+                          <<test/foobar::without-recursive-trampolines>>))))))
+   #+end_src
